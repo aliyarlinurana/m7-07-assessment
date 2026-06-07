@@ -93,7 +93,7 @@ flowchart TD
 | `container/` | [`Dockerfile`](container/Dockerfile) | Multi-stage build: builder + slim runtime, model baked in |
 | `container/` | [`README.md`](container/README.md) | Image plan: base image rationale, bake-vs-mount decision, size estimate |
 | `api/` | [`openapi.yaml`](api/openapi.yaml) | Full OpenAPI 3.1 spec: sync, batch, and async endpoints |
-| `api/examples/` | [`recommend.json`](api/examples/recommend.json) · [`batch.json`](api/examples/batch.json) | Sample request/response payloads |
+| `api/examples/` | [`recommend-request.json`](api/examples/recommend-request.json) · [`batch-request.json`](api/examples/batch-request.json) | Sample request/response payloads |
 | `serving/` | [`capacity-plan.md`](serving/capacity-plan.md) | Replica math, latency budget breakdown, hardware sizing |
 | `serving/` | [`slos.yaml`](serving/slos.yaml) | Measurable SLO objectives (latency, availability, error rate) |
 | `serving/` | [`load-test-plan.md`](serving/load-test-plan.md) | k6 load test plan, ramp profile, pass/fail criteria |
