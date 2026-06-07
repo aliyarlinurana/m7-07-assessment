@@ -1,0 +1,760 @@
+openapi: 3.1.0
+
+info:
+  title: NorthStar Inference API
+  version: 2.4.1
+  description: >
+    Personalized product recommendation API for the NorthStar mobile retail app.
+    Serves ranked recommendations at 800 RPS peak with a 120 ms p95 end-to-end budget.
+    Supports synchronous single-user inference, async batch scoring, and health/readiness probes.
+  contact:
+    name: ML Platform Team
+    email: ml-platform@northstar.internal
+
+servers:
+  - url: https://api.northstar.internal/v1
+    description: Production
+  - url: https://api-staging.northstar.internal/v1
+    description: Staging
+
+# ─────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────
+paths:
+
+  # ── SYNC ENDPOINT ────────────────────────────────────────────
+  /recommendations:
+    post:
+      operationId: getRecommendations
+      summary: Get personalized recommendations for a single user (synchronous)
+      description: >
+        Returns a ranked list of product recommendations for the given user.
+        Cold-start users (fewer than 3 events in last 30 days) are served from
+        the pre-materialized popularity fallback and receive `cold_start: true`
+        in the response.
+        The `X-Model-Version` response header identifies the model variant that
+        served this request; use it for A/B experiment attribution.
+      tags:
+        - Recommendations
+      parameters:
+        - $ref: '#/components/parameters/RequestIdHeader'
+        - $ref: '#/components/parameters/ModelVersionOverride'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecommendationRequest'
+            examples:
+              standard_user:
+                $ref: '#/components/examples/StandardUserRequest'
+              cold_start_user:
+                $ref: '#/components/examples/ColdStartUserRequest'
+      responses:
+        '200':
+          description: Ranked recommendations returned successfully
+          headers:
+            X-Model-Version:
+              $ref: '#/components/headers/XModelVersion'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-Latency-Ms:
+              $ref: '#/components/headers/XLatencyMs'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationResponse'
+              examples:
+                standard_response:
+                  $ref: '#/components/examples/StandardUserResponse'
+                cold_start_response:
+                  $ref: '#/components/examples/ColdStartUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ── ASYNC BATCH ENDPOINT ─────────────────────────────────────
+  /recommendations/batch:
+    post:
+      operationId: submitBatchRecommendations
+      summary: Submit an async batch scoring job (up to 10,000 users)
+      description: >
+        Enqueues a batch inference job for multiple users. Returns a `job_id`
+        immediately. Poll `/recommendations/batch/{job_id}` for results.
+        Batch jobs are processed within 60 seconds under normal load.
+        Intended for offline use-cases (email campaigns, push notifications)
+        — not for the real-time home-screen path.
+      tags:
+        - Batch
+      parameters:
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRequest'
+            examples:
+              batch_request:
+                $ref: '#/components/examples/BatchRequest'
+      responses:
+        '202':
+          description: Batch job accepted
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchJobAccepted'
+              examples:
+                batch_accepted:
+                  $ref: '#/components/examples/BatchJobAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /recommendations/batch/{job_id}:
+    get:
+      operationId: getBatchResults
+      summary: Poll batch job status and retrieve results
+      description: >
+        Returns job status (`pending`, `running`, `completed`, `failed`) and,
+        when `completed`, the full results payload. Results are retained for
+        24 hours after job completion.
+      tags:
+        - Batch
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Job ID returned by POST /recommendations/batch
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Job status (and results if completed)
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchJobStatus'
+              examples:
+                batch_completed:
+                  $ref: '#/components/examples/BatchJobCompleted'
+                batch_pending:
+                  $ref: '#/components/examples/BatchJobPending'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ── HEALTH / READINESS ───────────────────────────────────────
+  /health/live:
+    get:
+      operationId: liveness
+      summary: Liveness probe (Kubernetes)
+      description: >
+        Returns 200 if the process is alive. Used by Kubernetes liveness probe.
+        Does NOT check Redis or model readiness — a live but degraded pod should
+        still return 200 here; readiness probe handles traffic gating.
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessResponse'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      summary: Readiness probe (Kubernetes)
+      description: >
+        Returns 200 only when the service is ready to serve traffic:
+        ONNX model loaded, Redis reachable, feature flag SDK initialised.
+        Returns 503 otherwise — Kubernetes will remove this pod from
+        the load balancer until it recovers.
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service is ready to serve traffic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+              examples:
+                ready:
+                  $ref: '#/components/examples/ReadinessOK'
+        '503':
+          description: Service not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+              examples:
+                not_ready:
+                  $ref: '#/components/examples/ReadinessNotReady'
+
+  /health/metrics:
+    get:
+      operationId: prometheusMetrics
+      summary: Prometheus metrics scrape endpoint
+      description: >
+        Exposes Prometheus-format metrics including request latency histograms,
+        error rates, Redis connection pool stats, and model version label.
+        Scraped by Prometheus every 15 s.
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Prometheus metrics text
+          content:
+            text/plain:
+              schema:
+                type: string
+
+# ─────────────────────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────────────────────
+components:
+
+  # ── SCHEMAS ──────────────────────────────────────────────────
+  schemas:
+
+    RecommendationRequest:
+      type: object
+      required:
+        - user_id
+      properties:
+        user_id:
+          type: string
+          description: Unique user identifier. Used for Redis feature lookup and A/B assignment.
+          example: usr_7f3a9c12d4e8
+        num_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+          description: Number of ranked recommendations to return.
+        context:
+          $ref: '#/components/schemas/RequestContext'
+        filters:
+          $ref: '#/components/schemas/RecommendationFilters'
+
+    RequestContext:
+      type: object
+      description: Optional session-level context used by the re-ranker.
+      properties:
+        last_viewed_item_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 3
+          description: Up to 3 most recently viewed item IDs in the current session.
+          example: ["item_abc123", "item_def456"]
+        page:
+          type: string
+          enum: [home, pdp, cart, search]
+          default: home
+          description: Surface from which the request originates.
+
+    RecommendationFilters:
+      type: object
+      description: Optional hard filters applied before re-ranking.
+      properties:
+        category_ids:
+          type: array
+          items:
+            type: string
+          description: Restrict results to these category IDs.
+        in_stock_only:
+          type: boolean
+          default: true
+          description: Exclude out-of-stock items.
+        exclude_item_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 100
+          description: Item IDs to exclude (e.g. recently purchased).
+
+    RecommendationResponse:
+      type: object
+      required:
+        - user_id
+        - recommendations
+        - cold_start
+        - served_at
+      properties:
+        user_id:
+          type: string
+          example: usr_7f3a9c12d4e8
+        recommendations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecommendedItem'
+        cold_start:
+          type: boolean
+          description: True if the popularity fallback was used (insufficient history).
+        model_version:
+          type: string
+          description: Model version that served this response. Mirrors X-Model-Version header.
+          example: v2.4.1
+        served_at:
+          type: string
+          format: date-time
+          description: UTC timestamp when the response was generated.
+
+    RecommendedItem:
+      type: object
+      required:
+        - item_id
+        - rank
+        - score
+      properties:
+        item_id:
+          type: string
+          example: item_abc123
+        rank:
+          type: integer
+          minimum: 1
+          description: 1-based rank in the returned list.
+        score:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Re-ranking score. Higher is more relevant.
+          example: 0.932
+
+    BatchRequest:
+      type: object
+      required:
+        - user_ids
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 10000
+          description: List of user IDs to score.
+        num_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+        filters:
+          $ref: '#/components/schemas/RecommendationFilters'
+        callback_url:
+          type: string
+          format: uri
+          description: Optional webhook URL. POST with BatchJobStatus payload when completed.
+
+    BatchJobAccepted:
+      type: object
+      required:
+        - job_id
+        - status
+        - estimated_completion_seconds
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending]
+        estimated_completion_seconds:
+          type: integer
+          example: 45
+
+    BatchJobStatus:
+      type: object
+      required:
+        - job_id
+        - status
+        - created_at
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        num_users_requested:
+          type: integer
+        num_users_scored:
+          type: integer
+        num_cold_start:
+          type: integer
+          description: Users served from popularity fallback.
+        model_version:
+          type: string
+          example: v2.4.1
+        results:
+          type: array
+          nullable: true
+          description: Present only when status is `completed`.
+          items:
+            type: object
+            required:
+              - user_id
+              - recommendations
+              - cold_start
+            properties:
+              user_id:
+                type: string
+              recommendations:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecommendedItem'
+              cold_start:
+                type: boolean
+        error:
+          type: string
+          nullable: true
+          description: Present only when status is `failed`.
+
+    LivenessResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    ReadinessResponse:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          properties:
+            model_loaded:
+              type: boolean
+            redis_reachable:
+              type: boolean
+            feature_flag_sdk:
+              type: boolean
+        model_version:
+          type: string
+          nullable: true
+          example: v2.4.1
+
+    ErrorResponse:
+      type: object
+      required:
+        - error_code
+        - message
+        - request_id
+      properties:
+        error_code:
+          type: string
+          example: INVALID_USER_ID
+        message:
+          type: string
+          example: user_id must be a non-empty string
+        request_id:
+          type: string
+          format: uuid
+        details:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+  # ── PARAMETERS ───────────────────────────────────────────────
+  parameters:
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: >
+        Client-supplied idempotency / tracing ID. Echoed back in the response
+        X-Request-Id header. If omitted, the server generates one.
+
+    ModelVersionOverride:
+      name: X-Model-Version-Override
+      in: header
+      required: false
+      schema:
+        type: string
+      description: >
+        Force a specific model version for this request. Used by the A/B router
+        and canary traffic controller. Ignored in production for unauthenticated callers.
+
+  # ── HEADERS ──────────────────────────────────────────────────
+  headers:
+
+    XModelVersion:
+      description: >
+        Model version that served this response (e.g. v2.4.1).
+        Forwarded by the API Gateway to Downstream Consumers for A/B experiment attribution.
+        Monitored by the `model_version_mismatch` alert in monitoring/alerts.yaml.
+      schema:
+        type: string
+        example: v2.4.1
+
+    XRequestId:
+      description: Request trace ID. Matches the client-supplied X-Request-Id or server-generated UUID.
+      schema:
+        type: string
+        format: uuid
+
+    XLatencyMs:
+      description: Server-side processing time in milliseconds (excludes network transit).
+      schema:
+        type: number
+        format: float
+        example: 34.7
+
+  # ── RESPONSES ────────────────────────────────────────────────
+  responses:
+
+    BadRequest:
+      description: Request body or parameters are malformed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error_code: BAD_REQUEST
+            message: "num_results must be between 1 and 50"
+            request_id: "550e8400-e29b-41d4-a716-446655440000"
+
+    UnprocessableEntity:
+      description: Request is well-formed but semantically invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error_code: UNPROCESSABLE_ENTITY
+            message: "user_id contains invalid characters"
+            request_id: "550e8400-e29b-41d4-a716-446655440001"
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error_code: RATE_LIMITED
+            message: "Request rate limit exceeded. Retry after 1 second."
+            request_id: "550e8400-e29b-41d4-a716-446655440002"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error_code: NOT_FOUND
+            message: "Batch job not found or expired"
+            request_id: "550e8400-e29b-41d4-a716-446655440003"
+
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error_code: INTERNAL_ERROR
+            message: "An unexpected error occurred. The request_id has been logged."
+            request_id: "550e8400-e29b-41d4-a716-446655440004"
+
+    ServiceUnavailable:
+      description: >
+        Service is temporarily unavailable (Redis unreachable, model not loaded,
+        or circuit-breaker open). Client should retry with exponential backoff.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error_code: SERVICE_UNAVAILABLE
+            message: "Feature store temporarily unreachable. Falling back to cold-start."
+            request_id: "550e8400-e29b-41d4-a716-446655440005"
+
+  # ── EXAMPLES ─────────────────────────────────────────────────
+  examples:
+
+    StandardUserRequest:
+      summary: Standard user with full history
+      value:
+        user_id: usr_7f3a9c12d4e8
+        num_results: 20
+        context:
+          last_viewed_item_ids: ["item_abc123", "item_def456"]
+          page: home
+        filters:
+          in_stock_only: true
+
+    ColdStartUserRequest:
+      summary: Cold-start user with no history
+      value:
+        user_id: usr_new_0000001
+        num_results: 20
+        context:
+          page: home
+        filters:
+          in_stock_only: true
+
+    StandardUserResponse:
+      summary: Standard ranked response
+      value:
+        user_id: usr_7f3a9c12d4e8
+        cold_start: false
+        model_version: v2.4.1
+        served_at: "2026-06-07T14:32:01.123Z"
+        recommendations:
+          - item_id: item_xyz789
+            rank: 1
+            score: 0.963
+          - item_id: item_abc123
+            rank: 2
+            score: 0.921
+          - item_id: item_qrs456
+            rank: 3
+            score: 0.887
+
+    ColdStartUserResponse:
+      summary: Popularity fallback response
+      value:
+        user_id: usr_new_0000001
+        cold_start: true
+        model_version: v2.4.1
+        served_at: "2026-06-07T14:32:01.456Z"
+        recommendations:
+          - item_id: item_bestseller_001
+            rank: 1
+            score: 0.750
+          - item_id: item_bestseller_002
+            rank: 2
+            score: 0.741
+
+    BatchRequest:
+      summary: Batch scoring for 3 users
+      value:
+        user_ids:
+          - usr_7f3a9c12d4e8
+          - usr_4b2e8f1a9c3d
+          - usr_new_0000001
+        num_results: 20
+        filters:
+          in_stock_only: true
+        callback_url: "https://internal-service.northstar.internal/batch-callback"
+
+    BatchJobAccepted:
+      summary: Batch job accepted
+      value:
+        job_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        status: pending
+        estimated_completion_seconds: 45
+
+    BatchJobCompleted:
+      summary: Completed batch job with results
+      value:
+        job_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        status: completed
+        created_at: "2026-06-07T14:30:00.000Z"
+        completed_at: "2026-06-07T14:30:41.000Z"
+        num_users_requested: 3
+        num_users_scored: 3
+        num_cold_start: 1
+        model_version: v2.4.1
+        results:
+          - user_id: usr_7f3a9c12d4e8
+            cold_start: false
+            recommendations:
+              - item_id: item_xyz789
+                rank: 1
+                score: 0.963
+          - user_id: usr_new_0000001
+            cold_start: true
+            recommendations:
+              - item_id: item_bestseller_001
+                rank: 1
+                score: 0.750
+
+    BatchJobPending:
+      summary: Pending batch job
+      value:
+        job_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        status: pending
+        created_at: "2026-06-07T14:30:00.000Z"
+        completed_at: null
+
+    ReadinessOK:
+      summary: Service ready
+      value:
+        status: ready
+        checks:
+          model_loaded: true
+          redis_reachable: true
+          feature_flag_sdk: true
+        model_version: v2.4.1
+
+    ReadinessNotReady:
+      summary: Redis unreachable
+      value:
+        status: not_ready
+        checks:
+          model_loaded: true
+          redis_reachable: false
+          feature_flag_sdk: true
+        model_version: v2.4.1
+
+# ─────────────────────────────────────────────────────────────
+# TAGS
+# ─────────────────────────────────────────────────────────────
+tags:
+  - name: Recommendations
+    description: Synchronous single-user inference endpoint
+  - name: Batch
+    description: Async batch scoring — submit job and poll for results
+  - name: Health
+    description: Liveness, readiness, and Prometheus metrics endpoints

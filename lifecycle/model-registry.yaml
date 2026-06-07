@@ -1,0 +1,286 @@
+# model-registry.yaml
+# MLflow Model Registry specification for Scenario X — Personalized Recommendations
+# All fields marked REQUIRED must be present before a model version can leave CANDIDATE state.
+# Promotion gates are evaluated automatically by the CI/CD pipeline (deploy-model.yml).
+
+registry:
+  name: northstar-reranker
+  description: >
+    Re-ranking model for personalized product recommendations.
+    Serves the NorthStar mobile retail app at 800 RPS peak.
+  mlflow_tracking_uri: ${MLFLOW_TRACKING_URI}   # injected at runtime
+  artifact_store: s3://northstar-mlflow-artifacts/northstar-reranker
+
+# ─────────────────────────────────────────────
+# VERSION POLICY
+# Determines whether human sign-off is required
+# ─────────────────────────────────────────────
+version_policy:
+  # A version is MAJOR if ANY of the following change relative to the current champion:
+  major_triggers:
+    - model_architecture      # e.g. two-tower → transformer re-ranker
+    - feature_schema          # adding or removing input features
+    - embedding_dimension     # changes Redis key shape → requires pipeline migration
+    - training_framework      # e.g. PyTorch → JAX
+    - onnx_opset              # breaking opset bump
+  # Everything else (fresh training data, hyperparameter tuning, regularisation) is MINOR.
+  # Minor versions: automated gates only, no human required.
+  # Major versions: automated gates + human sign-off from ML Lead within 1 business day.
+  minor_auto_promote: true
+  major_requires_signoff: true
+  signoff_approvers:
+    - role: ml_lead
+      github_team: northstar-ml-leads
+    - role: product_lead           # required only when feature_schema changes
+      github_team: northstar-product
+      condition: feature_schema_changed
+
+# ─────────────────────────────────────────────
+# REQUIRED LINEAGE FIELDS
+# Must be logged to MLflow before promotion
+# ─────────────────────────────────────────────
+lineage:
+  required_fields:
+    run_metadata:
+      - field: run_id
+        type: string
+        description: MLflow run UUID
+      - field: run_timestamp
+        type: iso8601
+        description: UTC timestamp when training job started
+      - field: triggered_by
+        type: enum
+        values: [schedule, drift_alert, slo_breach, manual]
+        description: What initiated this training run
+
+    data_provenance:
+      - field: dataset_version
+        type: string
+        description: DVC dataset tag used for training (e.g. dataset-2026-06-07-02h00)
+      - field: dataset_snapshot_uri
+        type: string
+        description: S3 URI of the training dataset snapshot
+      - field: training_window_start
+        type: iso8601
+        description: Earliest event timestamp included in training data
+      - field: training_window_end
+        type: iso8601
+        description: Latest event timestamp included in training data
+      - field: num_training_examples
+        type: integer
+        description: Row count of training set after filtering
+      - field: data_validation_run_id
+        type: string
+        description: Great Expectations checkpoint run ID confirming data passed validation
+
+    model_artifact:
+      - field: model_sha256
+        type: string
+        description: SHA-256 of the ONNX model file
+      - field: model_size_mb
+        type: float
+        description: Size of the ONNX artifact in megabytes
+      - field: onnx_opset
+        type: integer
+        description: ONNX opset version used for export
+      - field: embedding_dimension
+        type: integer
+        description: Output dimension of user/item embeddings (must match Redis key shape)
+      - field: num_candidates
+        type: integer
+        description: Candidate set size the model was optimised to re-rank
+      - field: docker_image_tag
+        type: string
+        description: Full image tag baked with this model version (e.g. northstar-infer:v2.4.1)
+
+    environment:
+      - field: python_version
+        type: string
+        description: Python version used for training (e.g. 3.11.9)
+      - field: requirements_sha256
+        type: string
+        description: SHA-256 of pip-compile-generated requirements.txt
+      - field: training_hardware
+        type: string
+        description: Instance type used for training (e.g. ml.p3.2xlarge)
+      - field: random_seed
+        type: integer
+        description: Global random seed for reproducibility
+
+# ─────────────────────────────────────────────
+# PROMOTION GATES
+# Evaluated in order; all must pass to advance
+# ─────────────────────────────────────────────
+promotion_gates:
+
+  # Gate 1: CANDIDATE → STAGING
+  candidate_to_staging:
+    description: Offline evaluation against held-out test set
+    evaluator: ci_pipeline          # run automatically by deploy-model.yml
+    gates:
+      - name: ndcg_at_10
+        metric: eval/ndcg_at_10
+        condition: ">= champion_value - 0.01"
+        description: Challenger NDCG@10 must be within 1pp of current champion
+        blocking: true
+
+      - name: precision_at_5
+        metric: eval/precision_at_5
+        condition: ">= champion_value - 0.01"
+        description: Challenger Precision@5 must be within 1pp of current champion
+        blocking: true
+
+      - name: inference_latency_p95
+        metric: eval/latency_p95_ms
+        condition: "< 40"
+        description: p95 inference latency on benchmark hardware must be under 40 ms
+        unit: milliseconds
+        blocking: true
+
+      - name: model_size
+        metric: model_size_mb
+        condition: "<= 200"
+        description: ONNX artifact must not exceed 200 MB
+        unit: megabytes
+        blocking: true
+
+      - name: fairness_no_regression
+        metric: eval/worst_segment_ndcg_delta
+        condition: ">= -0.05"
+        description: No user segment (by cohort age bucket) may degrade > 5% vs champion
+        blocking: false          # non-blocking: logs warning, requires human acknowledgement for major versions
+        requires_ack_on_major: true
+
+      - name: lineage_complete
+        condition: all_required_lineage_fields_present
+        description: All required lineage fields must be logged in MLflow before promotion
+        blocking: true
+
+  # Gate 2: STAGING → CANARY
+  staging_to_canary:
+    description: Shadow traffic validation (0% user-facing traffic, full logging)
+    evaluator: inference_service    # checked by automated health monitor
+    shadow_requests: 100
+    shadow_timeout_minutes: 15
+    gates:
+      - name: shadow_error_rate
+        metric: shadow/error_rate
+        condition: "== 0"
+        description: Zero errors in 100 shadow requests
+        blocking: true
+
+      - name: shadow_latency_p95
+        metric: shadow/latency_p95_ms
+        condition: "< 120"
+        description: p95 latency in shadow mode under 120 ms
+        blocking: true
+
+      - name: redis_feature_compatibility
+        condition: embedding_dimension_matches_redis_key_shape
+        description: Model embedding dimension must match current Redis key schema
+        blocking: true
+
+  # Gate 3: CANARY → PRODUCTION
+  canary_to_production:
+    description: Live traffic ramp with metric gates at each step
+    evaluator: prometheus + ci_pipeline
+    traffic_steps:
+      - percent: 5
+        hold_minutes: 30
+        gates:
+          - name: error_rate
+            metric: http_request_error_rate{model_version="challenger"}
+            condition: "< 0.005"   # < 0.5%
+            blocking: true
+          - name: latency_p95
+            metric: http_request_duration_p95{model_version="challenger"}
+            condition: "< 120"
+            unit: milliseconds
+            blocking: true
+
+      - percent: 25
+        hold_minutes: 120
+        gates:
+          - name: error_rate
+            metric: http_request_error_rate{model_version="challenger"}
+            condition: "< 0.005"
+            blocking: true
+          - name: latency_p95
+            metric: http_request_duration_p95{model_version="challenger"}
+            condition: "< 120"
+            blocking: true
+          - name: ndcg_online_proxy
+            metric: experiment/challenger_vs_champion_ctr_lift
+            condition: ">= -0.01"
+            description: Online CTR proxy must not be more than 1% below champion
+            blocking: false        # advisory; human reviews before 100% ramp
+
+      - percent: 100
+        hold_minutes: 0            # immediate after 25% gate passes
+        gates:
+          - name: error_rate
+            metric: http_request_error_rate{model_version="challenger"}
+            condition: "< 0.005"
+            blocking: true
+
+    auto_rollback_on_gate_failure: true
+    rollback_action: set_router_flag_to_champion   # < 5 s, see ADR-0002
+
+# ─────────────────────────────────────────────
+# ROLLBACK POLICY
+# ─────────────────────────────────────────────
+rollback_policy:
+  automatic_triggers:
+    - condition: canary_gate_failure
+      action: set_router_flag_to_champion
+      notify: pagerduty
+    - condition: slo_burn_rate_breach_1h
+      action: set_router_flag_to_champion
+      notify: pagerduty
+    - condition: prediction_score_distribution_kl_gt_0_15
+      action: alert_only            # human decides; may be intentional (new model)
+      notify: pagerduty
+
+  manual_trigger:
+    command: "gh workflow run deploy-model.yml -f action=rollback -f target_version=<version>"
+    runbook: runbooks/rollback.md
+
+  post_rollback:
+    - state_transition: PRODUCTION → ROLLED_BACK
+    - preserve_green_pods_minutes: 60   # keep green pods alive for post-mortem
+    - create_incident_ticket: true
+    - queue_retraining: false           # default; engineer decides after root cause
+
+# ─────────────────────────────────────────────
+# RETENTION POLICY
+# ─────────────────────────────────────────────
+retention:
+  keep_production_versions: all         # never delete a version that reached PRODUCTION
+  keep_candidate_versions: 10           # keep last 10 candidates (per model family)
+  keep_archived_versions: 30_days       # prune ARCHIVED versions older than 30 days
+  artifact_storage_class: s3_standard_ia_after_90_days
+
+# ─────────────────────────────────────────────
+# NOTIFICATION HOOKS
+# ─────────────────────────────────────────────
+notifications:
+  on_candidate_registered:
+    - channel: slack
+      target: "#ml-deployments"
+  on_gate_failure:
+    - channel: slack
+      target: "#ml-deployments"
+    - channel: pagerduty
+      severity: warning
+  on_production_promotion:
+    - channel: slack
+      target: "#ml-deployments"
+    - channel: slack
+      target: "#product-recommendations"
+  on_rollback:
+    - channel: pagerduty
+      severity: critical
+    - channel: slack
+      target: "#ml-deployments"
+    - channel: slack
+      target: "#incidents"

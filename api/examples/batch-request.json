@@ -1,0 +1,12 @@
+{
+  "user_ids": [
+    "usr_7f3a9c12d4e8",
+    "usr_4b2e8f1a9c3d",
+    "usr_new_0000001"
+  ],
+  "num_results": 20,
+  "filters": {
+    "in_stock_only": true
+  },
+  "callback_url": "https://internal-service.northstar.internal/batch-callback"
+}

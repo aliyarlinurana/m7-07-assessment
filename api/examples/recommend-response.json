@@ -1,0 +1,11 @@
+{
+  "user_id": "usr_7f3a9c12d4e8",
+  "cold_start": false,
+  "model_version": "v2.4.1",
+  "served_at": "2026-06-07T14:32:01.123Z",
+  "recommendations": [
+    { "item_id": "item_xyz789", "rank": 1, "score": 0.963 },
+    { "item_id": "item_abc123", "rank": 2, "score": 0.921 },
+    { "item_id": "item_qrs456", "rank": 3, "score": 0.887 }
+  ]
+}

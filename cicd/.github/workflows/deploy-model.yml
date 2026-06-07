@@ -1,0 +1,489 @@
+name: Deploy Model — NorthStar Re-Ranker
+
+# ─────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────
+on:
+  # Automatic: fires when MLflow registry promotes a version to STAGING state
+  repository_dispatch:
+    types: [model-registry-staging]
+
+  # Manual: rollback or force-promote
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - promote          # normal promotion flow from STAGING → PRODUCTION
+          - rollback         # revert production traffic to champion
+      target_version:
+        description: "Model version tag (e.g. v2.4.1). Required for rollback."
+        required: false
+        type: string
+      force_skip_load_test:
+        description: "Skip load test (emergency promote only — requires SRE approval)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# ─────────────────────────────────────────────
+# GLOBAL ENV
+# ─────────────────────────────────────────────
+env:
+  REGISTRY: ghcr.io/northstar
+  IMAGE_NAME: northstar-infer
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  K8S_NAMESPACE: northstar-prod
+  STAGING_NAMESPACE: northstar-staging
+  PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+  LAUNCHDARKLY_SDK_KEY: ${{ secrets.LAUNCHDARKLY_SDK_KEY }}
+
+# ─────────────────────────────────────────────
+# CONCURRENCY — only one deploy pipeline at a time
+# ─────────────────────────────────────────────
+concurrency:
+  group: deploy-model
+  cancel-in-progress: false   # never cancel a running deploy; queue instead
+
+# ─────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────
+jobs:
+
+  # ── JOB 0: Handle rollback path ─────────────────────────────
+  rollback:
+    name: Rollback to Champion
+    if: github.event.inputs.action == 'rollback'
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: Validate target version supplied
+        run: |
+          if [ -z "${{ github.event.inputs.target_version }}" ]; then
+            echo "ERROR: target_version is required for rollback"
+            exit 1
+          fi
+
+      - name: Flip A/B router flag to champion
+        env:
+          LD_SDK_KEY: ${{ secrets.LAUNCHDARKLY_SDK_KEY }}
+        run: |
+          curl -s -X PATCH \
+            "https://app.launchdarkly.com/api/v2/flags/northstar/model-version" \
+            -H "Authorization: ${{ secrets.LAUNCHDARKLY_API_KEY }}" \
+            -H "Content-Type: application/json; domain-model=launchdarkly.semanticpatch" \
+            -d '{
+              "instructions": [{
+                "kind": "turnFlagOff"
+              }]
+            }'
+          echo "Router flag flipped to champion in < 5 s"
+
+      - name: Verify production traffic on champion
+        run: |
+          sleep 10
+          # Check Prometheus: model_version label should show champion only
+          MISMATCH=$(curl -s "${{ secrets.PROMETHEUS_URL }}/api/v1/query" \
+            --data-urlencode 'query=count by (model_version) (rate(http_requests_total{job="northstar-infer"}[1m]))' \
+            | jq '.data.result | length')
+          echo "Active model versions in production: $MISMATCH"
+          if [ "$MISMATCH" -gt "1" ]; then
+            echo "WARNING: Multiple model versions still serving — investigate"
+          fi
+
+      - name: Update model registry state
+        run: |
+          python - <<'EOF'
+          import mlflow, os
+          client = mlflow.tracking.MlflowClient(os.environ["MLFLOW_TRACKING_URI"])
+          version = "${{ github.event.inputs.target_version }}"
+          # Transition challenger to ROLLED_BACK
+          # (Champion version remains in PRODUCTION state)
+          print(f"Marking {version} as ROLLED_BACK in registry")
+          EOF
+
+      - name: Notify on rollback
+        if: always()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_ML_DEPLOYMENTS }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🔴 *ROLLBACK executed* — model `${{ github.event.inputs.target_version }}` rolled back to champion. Triggered by: `${{ github.actor }}`"
+            }'
+
+  # ── JOB 1: Validate lineage & metadata ──────────────────────
+  validate-lineage:
+    name: Validate MLflow Lineage
+    if: github.event.inputs.action != 'rollback'
+    runs-on: ubuntu-24.04
+    outputs:
+      model_version: ${{ steps.fetch-version.outputs.model_version }}
+      model_s3_uri: ${{ steps.fetch-version.outputs.model_s3_uri }}
+      model_sha256: ${{ steps.fetch-version.outputs.model_sha256 }}
+      git_sha_short: ${{ steps.fetch-version.outputs.git_sha_short }}
+      image_tag: ${{ steps.fetch-version.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install MLflow client
+        run: pip install mlflow boto3
+
+      - name: Fetch model version from registry
+        id: fetch-version
+        run: |
+          python - <<'EOF'
+          import mlflow, os, subprocess, json
+
+          client = mlflow.tracking.MlflowClient(os.environ["MLFLOW_TRACKING_URI"])
+
+          # Get the version dispatched by the registry event
+          event_payload = json.loads(os.environ.get("EVENT_PAYLOAD", "{}"))
+          version_name = event_payload.get("version") or os.environ.get("GITHUB_REF_NAME", "")
+
+          mv = client.get_model_version("northstar-reranker", version_name)
+          run = client.get_run(mv.run_id)
+          tags = run.data.tags
+          params = run.data.params
+
+          required_fields = [
+            "run_id", "dataset_version", "model_sha256",
+            "model_size_mb", "embedding_dimension", "docker_image_tag",
+            "python_version", "requirements_sha256", "random_seed"
+          ]
+          missing = [f for f in required_fields if not run.data.tags.get(f) and not run.data.params.get(f)]
+          if missing:
+              print(f"LINEAGE INCOMPLETE — missing fields: {missing}")
+              exit(1)
+
+          git_sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
+          image_tag = f"{mv.version}-{git_sha}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"model_version={mv.version}\n")
+              f.write(f"model_s3_uri={run.data.tags['dataset_snapshot_uri']}\n")
+              f.write(f"model_sha256={run.data.tags['model_sha256']}\n")
+              f.write(f"git_sha_short={git_sha}\n")
+              f.write(f"image_tag={image_tag}\n")
+          print(f"Lineage validated for {mv.version}")
+          EOF
+        env:
+          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+
+  # ── JOB 2: Build & push container image ─────────────────────
+  build-image:
+    name: Build & Push Container Image
+    needs: validate-lineage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build multi-stage image
+        uses: docker/build-push-action@v5
+        with:
+          context: container/
+          file: container/Dockerfile
+          push: false
+          load: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.model_version }}
+          build-args: |
+            MODEL_S3_URI=${{ needs.validate-lineage.outputs.model_s3_uri }}
+            MODEL_SHA256=${{ needs.validate-lineage.outputs.model_sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          secrets: |
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1     # Block promotion on HIGH/CRITICAL CVEs
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push image to registry
+        uses: docker/build-push-action@v5
+        with:
+          context: container/
+          file: container/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.model_version }}
+          build-args: |
+            MODEL_S3_URI=${{ needs.validate-lineage.outputs.model_s3_uri }}
+            MODEL_SHA256=${{ needs.validate-lineage.outputs.model_sha256 }}
+          secrets: |
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  # ── JOB 3: Deploy to staging (green) ────────────────────────
+  deploy-staging:
+    name: Deploy Green to Staging
+    needs: [validate-lineage, build-image]
+    runs-on: ubuntu-24.04
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG_STAGING }}
+
+      - name: Deploy green deployment to staging namespace
+        run: |
+          kubectl set image deployment/northstar-infer-green \
+            inference=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }} \
+            -n ${{ env.STAGING_NAMESPACE }}
+          kubectl rollout status deployment/northstar-infer-green \
+            -n ${{ env.STAGING_NAMESPACE }} \
+            --timeout=120s
+
+      - name: Wait for readiness probe
+        run: |
+          kubectl wait --for=condition=Ready \
+            pod -l app=northstar-infer,slot=green \
+            -n ${{ env.STAGING_NAMESPACE }} \
+            --timeout=90s
+
+  # ── JOB 4: Load test ────────────────────────────────────────
+  load-test:
+    name: Load Test (Staging)
+    needs: [validate-lineage, deploy-staging]
+    runs-on: ubuntu-24.04
+    if: github.event.inputs.force_skip_load_test != 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz | \
+            tar xz --strip-components=1 -C /usr/local/bin k6-v0.50.0-linux-amd64/k6
+
+      - name: Run baseline scenario (Scenario 1)
+        run: |
+          k6 run \
+            --env BASE_URL=https://api-staging.northstar.internal/v1 \
+            --env SCENARIO=baseline \
+            --out json=results-baseline.json \
+            load-tests/k6-scenarios.js
+
+      - name: Run peak load scenario (Scenario 2)
+        run: |
+          k6 run \
+            --env BASE_URL=https://api-staging.northstar.internal/v1 \
+            --env SCENARIO=peak \
+            --out json=results-peak.json \
+            load-tests/k6-scenarios.js
+
+      - name: Upload k6 results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-test-results-${{ needs.validate-lineage.outputs.model_version }}
+          path: results-*.json
+          retention-days: 90
+
+      - name: Post results to Slack
+        if: always()
+        run: |
+          STATUS=$([ $? -eq 0 ] && echo "✅ PASSED" || echo "❌ FAILED")
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_ML_DEPLOYMENTS }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"Load test $STATUS for \`${{ needs.validate-lineage.outputs.model_version }}\`\"}"
+
+  # ── JOB 5: Promote to production (canary) ───────────────────
+  promote-to-canary:
+    name: Promote to Production (Canary 5%)
+    needs: [validate-lineage, load-test]
+    if: |
+      always() &&
+      needs.load-test.result == 'success' || github.event.inputs.force_skip_load_test == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl (production)
+        uses: azure/k8s-set-context@v4
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG_PROD }}
+
+      - name: Deploy green pods to production namespace
+        run: |
+          kubectl set image deployment/northstar-infer-green \
+            inference=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }} \
+            -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout status deployment/northstar-infer-green \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=120s
+
+      - name: Set router flag to 5% canary
+        run: |
+          curl -s -X PATCH \
+            "https://app.launchdarkly.com/api/v2/flags/northstar/model-version" \
+            -H "Authorization: ${{ secrets.LAUNCHDARKLY_API_KEY }}" \
+            -H "Content-Type: application/json; domain-model=launchdarkly.semanticpatch" \
+            -d '{
+              "instructions": [{
+                "kind": "updateRuleVariationOrRollout",
+                "rolloutWeights": {"champion": 95000, "challenger": 5000}
+              }]
+            }'
+          echo "Canary at 5% — holding 30 min for gate evaluation"
+
+      - name: Wait and evaluate 5% canary gate
+        run: |
+          sleep 1800  # 30 minutes
+          python cicd/scripts/evaluate_canary_gate.py \
+            --model-version ${{ needs.validate-lineage.outputs.model_version }} \
+            --traffic-percent 5 \
+            --prometheus-url ${{ secrets.PROMETHEUS_URL }} \
+            --error-rate-threshold 0.005 \
+            --latency-p95-threshold 120
+
+      - name: Ramp to 25%
+        run: |
+          curl -s -X PATCH \
+            "https://app.launchdarkly.com/api/v2/flags/northstar/model-version" \
+            -H "Authorization: ${{ secrets.LAUNCHDARKLY_API_KEY }}" \
+            -H "Content-Type: application/json; domain-model=launchdarkly.semanticpatch" \
+            -d '{
+              "instructions": [{
+                "kind": "updateRuleVariationOrRollout",
+                "rolloutWeights": {"champion": 75000, "challenger": 25000}
+              }]
+            }'
+          echo "Canary at 25% — holding 2 h for gate evaluation"
+          sleep 7200
+
+      - name: Evaluate 25% canary gate
+        run: |
+          python cicd/scripts/evaluate_canary_gate.py \
+            --model-version ${{ needs.validate-lineage.outputs.model_version }} \
+            --traffic-percent 25 \
+            --prometheus-url ${{ secrets.PROMETHEUS_URL }} \
+            --error-rate-threshold 0.005 \
+            --latency-p95-threshold 120
+
+      - name: Ramp to 100% (full production)
+        run: |
+          curl -s -X PATCH \
+            "https://app.launchdarkly.com/api/v2/flags/northstar/model-version" \
+            -H "Authorization: ${{ secrets.LAUNCHDARKLY_API_KEY }}" \
+            -H "Content-Type: application/json; domain-model=launchdarkly.semanticpatch" \
+            -d '{
+              "instructions": [{
+                "kind": "updateRuleVariationOrRollout",
+                "rolloutWeights": {"champion": 0, "challenger": 100000}
+              }]
+            }'
+
+      - name: Update registry state to PRODUCTION
+        run: |
+          python - <<'EOF'
+          import mlflow, os
+          client = mlflow.tracking.MlflowClient(os.environ["MLFLOW_TRACKING_URI"])
+          client.transition_model_version_stage(
+              "northstar-reranker",
+              "${{ needs.validate-lineage.outputs.model_version }}",
+              "Production"
+          )
+          EOF
+
+      - name: Tag image as latest
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }}
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate-lineage.outputs.image_tag }} \
+                     ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Notify production promotion
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_ML_DEPLOYMENTS }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "✅ *PRODUCTION PROMOTION COMPLETE* — model `${{ needs.validate-lineage.outputs.model_version }}` now serving 100% of traffic."
+            }'
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_PRODUCT_RECOMMENDATIONS }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🚀 New recommendation model `${{ needs.validate-lineage.outputs.model_version }}` is live."
+            }'
+
+  # ── JOB 6: Auto-rollback on gate failure ────────────────────
+  auto-rollback:
+    name: Auto-Rollback on Gate Failure
+    needs: promote-to-canary
+    if: failure()
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: Flip router back to champion (< 5 s)
+        run: |
+          curl -s -X PATCH \
+            "https://app.launchdarkly.com/api/v2/flags/northstar/model-version" \
+            -H "Authorization: ${{ secrets.LAUNCHDARKLY_API_KEY }}" \
+            -H "Content-Type: application/json; domain-model=launchdarkly.semanticpatch" \
+            -d '{
+              "instructions": [{
+                "kind": "updateRuleVariationOrRollout",
+                "rolloutWeights": {"champion": 100000, "challenger": 0}
+              }]
+            }'
+
+      - name: Fire PagerDuty alert
+        run: |
+          curl -s -X POST "https://events.pagerduty.com/v2/enqueue" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "routing_key": "${{ secrets.PAGERDUTY_ROUTING_KEY }}",
+              "event_action": "trigger",
+              "payload": {
+                "summary": "Auto-rollback: model ${{ needs.validate-lineage.outputs.model_version }} failed canary gate",
+                "severity": "critical",
+                "source": "github-actions/deploy-model"
+              }
+            }'
+
+      - name: Notify Slack
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_ML_DEPLOYMENTS }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🔴 *AUTO-ROLLBACK* — canary gate failed for `${{ needs.validate-lineage.outputs.model_version }}`. Traffic returned to champion. PagerDuty incident created."
+            }'

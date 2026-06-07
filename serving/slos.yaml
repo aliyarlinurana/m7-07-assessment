@@ -1,0 +1,197 @@
+# slos.yaml — NorthStar Inference Service
+# Service Level Objectives for Scenario X: Personalized In-App Recommendations
+# These SLOs are the authoritative source of truth referenced by:
+#   - monitoring/alerts.yaml (burn-rate thresholds)
+#   - serving/capacity-plan.md (latency budget)
+#   - runbooks/rollback.md (rollback trigger thresholds)
+#   - cicd/.github/workflows/deploy-model.yml (canary promotion gates)
+
+service:
+  name: northstar-infer
+  owner: sre-team
+  pagerduty_service_id: NORTHSTAR_INFER
+  review_cadence: monthly
+  last_reviewed: 2026-06-07
+
+# ─────────────────────────────────────────────
+# SLO DEFINITIONS
+# ─────────────────────────────────────────────
+slos:
+
+  # ── SLO 1: Availability ───────────────────────────────────────
+  - id: slo_availability
+    name: Request Success Rate
+    description: >
+      Fraction of all HTTP requests to /recommendations and /recommendations/batch
+      that complete with a non-5xx status code. 503s caused by the cold-start
+      fallback activating are NOT counted as errors (service degraded gracefully).
+    sli:
+      type: availability
+      good_events: http_requests_total{status!~"5..", job="northstar-infer"}
+      total_events: http_requests_total{job="northstar-infer"}
+      measurement_window: 28d
+    objectives:
+      - window: 28d
+        target: 0.999        # 99.9% — allows ~40 min downtime per 28 days
+      - window: 7d
+        target: 0.999
+    error_budget:
+      monthly_minutes: 43.2  # 99.9% of 43,200 min/month = 43.2 min budget
+    alerting:
+      # References monitoring/alerts.yaml: slo_availability_fast_burn, slo_availability_slow_burn
+      fast_burn_window: 1h
+      fast_burn_threshold: 14x   # consuming budget 14× faster than sustainable
+      slow_burn_window: 6h
+      slow_burn_threshold: 6x
+
+  # ── SLO 2: Latency (p95 end-to-end) ──────────────────────────
+  - id: slo_latency_p95
+    name: p95 End-to-End Latency
+    description: >
+      95th percentile end-to-end response latency for /recommendations (sync endpoint),
+      measured at the API Gateway. Includes Redis GET, ONNX inference, and serialisation.
+      Excludes batch endpoint (/recommendations/batch) which has a separate SLO.
+      Cold-start requests are included — the popularity fallback is also subject to 120 ms.
+    sli:
+      type: latency
+      metric: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="northstar-infer", path="/recommendations"}[5m]))
+      threshold_ms: 120
+      measurement_window: 28d
+    objectives:
+      - window: 28d
+        target: 0.99         # 99% of requests complete within 120 ms
+      - window: 7d
+        target: 0.99
+    error_budget:
+      monthly_minutes: 432   # 99% of 43,200 min = 432 min budget
+    alerting:
+      fast_burn_window: 1h
+      fast_burn_threshold: 14x
+      slow_burn_window: 6h
+      slow_burn_threshold: 6x
+
+  # ── SLO 3: Latency (p99 end-to-end) ──────────────────────────
+  - id: slo_latency_p99
+    name: p99 End-to-End Latency
+    description: >
+      99th percentile end-to-end response latency for /recommendations.
+      A tighter signal for tail latency regressions caused by Redis or model bloat.
+    sli:
+      type: latency
+      metric: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{job="northstar-infer", path="/recommendations"}[5m]))
+      threshold_ms: 200
+      measurement_window: 28d
+    objectives:
+      - window: 28d
+        target: 0.99
+      - window: 7d
+        target: 0.99
+    alerting:
+      fast_burn_window: 1h
+      fast_burn_threshold: 14x
+      slow_burn_window: 6h
+      slow_burn_threshold: 6x
+
+  # ── SLO 4: Batch Job Completion Time ─────────────────────────
+  - id: slo_batch_completion
+    name: Batch Job Completion Time
+    description: >
+      95th percentile time from batch job submission to job status = completed,
+      for jobs with up to 10,000 users. Measured from job creation timestamp
+      to completion timestamp in the job queue.
+    sli:
+      type: latency
+      metric: histogram_quantile(0.95, rate(batch_job_duration_seconds_bucket{job="northstar-infer"}[1h]))
+      threshold_ms: 60000    # 60 seconds
+      measurement_window: 28d
+    objectives:
+      - window: 28d
+        target: 0.95
+    alerting:
+      fast_burn_window: 1h
+      fast_burn_threshold: 10x
+      slow_burn_window: 6h
+      slow_burn_threshold: 5x
+
+  # ── SLO 5: Feature Freshness ──────────────────────────────────
+  - id: slo_feature_freshness
+    name: Redis Feature Freshness
+    description: >
+      Maximum age of user embeddings in Redis at any given time.
+      The batch pipeline runs every 1–6 hours; embeddings must never be more
+      than 2 hours stale. This is a known characteristic (not a defect) documented
+      in ADR-0001. Measured as time since the last successful batch write.
+    sli:
+      type: freshness
+      metric: time() - northstar_feature_pipeline_last_success_timestamp_seconds
+      threshold_seconds: 7200   # 2 hours
+      measurement_window: 28d
+    objectives:
+      - window: 28d
+        target: 0.99           # embeddings are fresh 99% of the time
+    alerting:
+      # Alert fires if pipeline has not completed within 2× expected cadence (ADR-0001)
+      staleness_alert_seconds: 7200
+      pagerduty: true
+
+  # ── SLO 6: Cold-Start Fallback Rate ───────────────────────────
+  - id: slo_cold_start_rate
+    name: Cold-Start Fallback Rate
+    description: >
+      Fraction of /recommendations requests served from the popularity fallback
+      (cold_start=true). A sudden spike signals a Redis outage or embedding
+      pipeline failure, not an organic increase in new users.
+      Organic cold-start rate is expected to be < 5% of requests in steady state.
+    sli:
+      type: ratio
+      metric: rate(northstar_cold_start_requests_total[5m]) / rate(http_requests_total{path="/recommendations"}[5m])
+      threshold: 0.10          # alert if cold-start rate exceeds 10%
+      measurement_window: 28d
+    objectives:
+      - window: 28d
+        target: 0.95           # cold-start rate stays below 10% for 95% of time windows
+    alerting:
+      threshold: 0.10
+      window: 5m
+      pagerduty: true
+
+# ─────────────────────────────────────────────
+# ERROR BUDGET POLICY
+# ─────────────────────────────────────────────
+error_budget_policy:
+  when_budget_exceeds_50_percent_consumed:
+    - action: review_recent_incidents
+    - action: freeze_non_critical_deploys
+    - notify: slack_channel_ml_deployments
+
+  when_budget_exceeds_100_percent_consumed:
+    - action: incident_declared
+    - action: freeze_all_deploys_until_resolved
+    - action: postmortem_required_within_5_business_days
+    - notify: pagerduty_critical
+    - notify: slack_channel_incidents
+
+  budget_reset: rolling_28d   # error budget resets on a rolling 28-day window, not calendar month
+
+# ─────────────────────────────────────────────
+# SLO EXCLUSIONS
+# ─────────────────────────────────────────────
+exclusions:
+  - description: Scheduled maintenance windows
+    max_duration_minutes: 30
+    requires_advance_notice_hours: 24
+    notify: slack_channel_ml_deployments
+
+  - description: Upstream dependency outages (AWS us-east-1 region event)
+    condition: aws_health_event_active
+    policy: exclude_from_error_budget
+
+# ─────────────────────────────────────────────
+# REFERENCES
+# ─────────────────────────────────────────────
+references:
+  alerting_rules: monitoring/alerts.yaml
+  capacity_plan: serving/capacity-plan.md
+  rollback_runbook: runbooks/rollback.md
+  adr_latency_decision: architecture/adr/0001-precomputed-features.md
+  adr_deploy_strategy: architecture/adr/0002-blue-green-deploy.md

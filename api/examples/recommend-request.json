@@ -1,0 +1,11 @@
+{
+  "user_id": "usr_7f3a9c12d4e8",
+  "num_results": 20,
+  "context": {
+    "last_viewed_item_ids": ["item_abc123", "item_def456"],
+    "page": "home"
+  },
+  "filters": {
+    "in_stock_only": true
+  }
+}

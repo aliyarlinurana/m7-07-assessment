@@ -1,0 +1,363 @@
+# monitoring/alerts.yaml
+# Prometheus alerting rules for NorthStar Inference Service — Scenario X
+#
+# All burn-rate thresholds are derived from SLOs defined in serving/slos.yaml.
+# Rollback triggers reference runbooks/rollback.md.
+# Model version mismatch alert monitors X-Model-Version header
+# as defined in api/openapi.yaml.
+#
+# Deploy with: kubectl apply -f monitoring/alerts.yaml
+# Or load into Prometheus via AlertManager config.
+
+groups:
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 1: SLO BURN-RATE ALERTS (Availability)
+  # SLO: slo_availability — 99.9% success rate over 28 days
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.slo.availability
+    rules:
+
+      - alert: NorthStarAvailabilityFastBurn
+        # Fires when error budget is consumed 14× faster than sustainable over 1 h.
+        # At this rate the monthly budget would exhaust in ~2 h.
+        expr: |
+          (
+            sum(rate(http_requests_total{job="northstar-infer", status=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total{job="northstar-infer"}[1h]))
+          ) > (14 * (1 - 0.999))
+        for: 2m
+        labels:
+          severity: critical
+          team: sre
+          service: northstar-infer
+          slo: slo_availability
+        annotations:
+          summary: "NorthStar: availability fast burn (1 h window)"
+          description: >
+            Error rate is {{ $value | humanizePercentage }} over the last 1 h.
+            This burns the availability error budget 14× faster than sustainable.
+            At this rate the monthly SLO budget will exhaust in ~2 h.
+          runbook: runbooks/rollback.md
+          dashboard: https://grafana.northstar.internal/d/northstar-infer
+
+      - alert: NorthStarAvailabilitySlowBurn
+        # Fires when error budget is consumed 6× faster than sustainable over 6 h.
+        # Catches gradual degradation that fast-burn misses.
+        expr: |
+          (
+            sum(rate(http_requests_total{job="northstar-infer", status=~"5.."}[6h]))
+            /
+            sum(rate(http_requests_total{job="northstar-infer"}[6h]))
+          ) > (6 * (1 - 0.999))
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: northstar-infer
+          slo: slo_availability
+        annotations:
+          summary: "NorthStar: availability slow burn (6 h window)"
+          description: >
+            Error rate is {{ $value | humanizePercentage }} over the last 6 h.
+            This is a slow but sustained burn of the availability error budget.
+          runbook: runbooks/rollback.md
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 2: SLO BURN-RATE ALERTS (Latency p95)
+  # SLO: slo_latency_p95 — 99% of requests complete within 120 ms
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.slo.latency
+    rules:
+
+      - alert: NorthStarLatencyP95FastBurn
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_bucket{job="northstar-infer", path="/recommendations", le="0.12"}[1h]))
+            /
+            sum(rate(http_request_duration_seconds_count{job="northstar-infer", path="/recommendations"}[1h]))
+          ) < (1 - 14 * (1 - 0.99))
+        for: 2m
+        labels:
+          severity: critical
+          team: sre
+          service: northstar-infer
+          slo: slo_latency_p95
+        annotations:
+          summary: "NorthStar: p95 latency fast burn (1 h window)"
+          description: >
+            Only {{ $value | humanizePercentage }} of requests completed within 120 ms
+            over the last 1 h. Fast-burning the latency error budget (14×).
+            Check Redis GET latency and ONNX inference latency.
+          runbook: runbooks/rollback.md
+
+      - alert: NorthStarLatencyP95SlowBurn
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_bucket{job="northstar-infer", path="/recommendations", le="0.12"}[6h]))
+            /
+            sum(rate(http_request_duration_seconds_count{job="northstar-infer", path="/recommendations"}[6h]))
+          ) < (1 - 6 * (1 - 0.99))
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: northstar-infer
+          slo: slo_latency_p95
+        annotations:
+          summary: "NorthStar: p95 latency slow burn (6 h window)"
+          description: >
+            Gradual latency degradation detected over 6 h.
+            Consider rolling back if trend continues.
+          runbook: runbooks/rollback.md
+
+      - alert: NorthStarLatencyP99Elevated
+        # Non-SLO alert; early warning for tail latency regression
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="northstar-infer", path="/recommendations"}[5m])) by (le)
+          ) > 0.200
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: p99 latency > 200 ms"
+          description: >
+            p99 latency is {{ $value | humanizeDuration }}.
+            Threshold: 200 ms. May indicate Redis contention or model bloat.
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 3: MODEL VERSION MISMATCH
+  # Monitors X-Model-Version header as per api/openapi.yaml.
+  # Fires when an unexpected model version appears in production traffic.
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.model.version
+    rules:
+
+      - alert: NorthStarModelVersionMismatch
+        # Fires when more than 1 distinct model_version label is present in production
+        # outside of a known A/B experiment window.
+        # The X-Model-Version response header is scraped as a Prometheus label by the
+        # inference service's /health/metrics endpoint.
+        expr: |
+          count by (job) (
+            count by (model_version) (
+              rate(http_requests_total{job="northstar-infer"}[5m])
+            )
+          ) > 1
+          unless on() northstar_ab_experiment_active == 1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: unexpected model version mismatch in production"
+          description: >
+            Multiple model versions are serving production traffic but no A/B experiment
+            is marked active. This may indicate a stale deployment or misconfigured
+            router flag.
+            Investigate: check LaunchDarkly flag state and Kubernetes deployment status.
+          runbook: runbooks/rollback.md
+
+      - alert: NorthStarModelVersionHeaderMissing
+        # Fires if any replica stops emitting the X-Model-Version header.
+        # Every response must include this header per api/openapi.yaml.
+        expr: |
+          sum(rate(http_requests_total{job="northstar-infer", model_version=""}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: X-Model-Version header missing on some responses"
+          description: >
+            Some requests are returning without the X-Model-Version header.
+            A/B experiment attribution and drift monitoring will be broken.
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 4: FEATURE STORE (REDIS) HEALTH
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.redis
+    rules:
+
+      - alert: NorthStarRedisUnreachable
+        expr: |
+          northstar_redis_connection_pool_available{job="northstar-infer"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          team: sre
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: Redis feature store unreachable"
+          description: >
+            All Redis connections in the pool are unavailable.
+            The circuit-breaker is open; inference service is falling back to
+            cold-start popularity list for ALL requests.
+            Escalate immediately — this degrades recommendation quality to 0%.
+          runbook: runbooks/rollback.md
+
+      - alert: NorthStarRedisLatencyElevated
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(northstar_redis_get_duration_seconds_bucket{job="northstar-infer"}[5m])) by (le)
+          ) > 0.010
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: Redis GET p99 latency > 10 ms"
+          description: >
+            Redis GET p99 is {{ $value | humanizeDuration }}.
+            Expected: 2–5 ms (ADR-0001). This is eating into the 120 ms latency budget.
+
+      - alert: NorthStarColdStartRateHigh
+        # Sudden spike in cold-start rate signals Redis outage or pipeline failure,
+        # not organic new-user growth. See slo_cold_start_rate in slos.yaml.
+        expr: |
+          (
+            rate(northstar_cold_start_requests_total{job="northstar-infer"}[5m])
+            /
+            rate(http_requests_total{job="northstar-infer", path="/recommendations"}[5m])
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-infer
+          slo: slo_cold_start_rate
+        annotations:
+          summary: "NorthStar: cold-start fallback rate > 10%"
+          description: >
+            {{ $value | humanizePercentage }} of /recommendations requests are being served
+            from the popularity fallback. Expected steady-state: < 5%.
+            Check Redis health and feature pipeline status.
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 5: FEATURE PIPELINE FRESHNESS
+  # See slo_feature_freshness in slos.yaml — embeddings must not be > 2 h stale.
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.pipeline
+    rules:
+
+      - alert: NorthStarFeaturePipelineOverdue
+        # Fires if the batch pipeline has not completed within 2× expected cadence (2 h).
+        # Reference: ADR-0001 — batch pipeline runs every 1–6 h.
+        expr: |
+          (time() - northstar_feature_pipeline_last_success_timestamp_seconds) > 7200
+        for: 0m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-feature-pipeline
+        annotations:
+          summary: "NorthStar: feature pipeline overdue (> 2 h since last success)"
+          description: >
+            Last successful feature pipeline completion was {{ $value | humanizeDuration }} ago.
+            User embeddings in Redis are becoming stale.
+            Check Airflow/scheduler for pipeline failures.
+
+      - alert: NorthStarFeaturePipelineCriticallyOverdue
+        expr: |
+          (time() - northstar_feature_pipeline_last_success_timestamp_seconds) > 14400
+        for: 0m
+        labels:
+          severity: critical
+          team: ml-platform
+          service: northstar-feature-pipeline
+        annotations:
+          summary: "NorthStar: feature pipeline critically overdue (> 4 h)"
+          description: >
+            Feature embeddings are > 4 h stale. SLO slo_feature_freshness is breached.
+            Immediate investigation required.
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 6: DRIFT DETECTION
+  # Evidently exports these metrics; Prometheus scrapes them.
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.drift
+    rules:
+
+      - alert: NorthStarFeatureDrift
+        # PSI > 0.2 triggers retraining (see lifecycle/lifecycle.md Stage 2)
+        expr: |
+          northstar_feature_psi{job="northstar-evidently"} > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: feature distribution drift detected (PSI > 0.2)"
+          description: >
+            Feature PSI for {{ $labels.feature_name }} is {{ $value }}.
+            This exceeds the 0.2 threshold and will trigger a retraining job.
+            Investigate whether drift is expected (seasonal, campaign) or anomalous.
+
+      - alert: NorthStarPredictionScoreDrift
+        # KL divergence > 0.15 on prediction scores (unexpectedly, outside known experiment)
+        # Reference: ADR-0002 consequences table
+        expr: |
+          northstar_prediction_score_kl_divergence{job="northstar-evidently"}
+          > 0.15
+          unless on() northstar_ab_experiment_active == 1
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: prediction score distribution drift (KL > 0.15)"
+          description: >
+            Prediction score KL divergence is {{ $value }}.
+            No A/B experiment is active. This may indicate a model regression or
+            a data distribution shift. Review before next promotion.
+
+  # ─────────────────────────────────────────────────────────────
+  # GROUP 7: INFRASTRUCTURE
+  # ─────────────────────────────────────────────────────────────
+  - name: northstar.infrastructure
+    rules:
+
+      - alert: NorthStarReplicaCountLow
+        # Production should run 8 replicas (capacity-plan.md). Alert if < 6 (HPA min is 4).
+        expr: |
+          kube_deployment_status_replicas_available{
+            namespace="northstar-prod",
+            deployment=~"northstar-infer.*"
+          } < 6
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: fewer than 6 inference replicas available"
+          description: >
+            Only {{ $value }} replicas are available. At 800 RPS, each replica handles ~100 RPS.
+            Reduced capacity means latency SLO is at risk.
+
+      - alert: NorthStarPodCrashLooping
+        expr: |
+          rate(kube_pod_container_status_restarts_total{
+            namespace="northstar-prod",
+            container="inference"
+          }[15m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          team: sre
+          service: northstar-infer
+        annotations:
+          summary: "NorthStar: inference pod crash-looping"
+          description: >
+            Pod {{ $labels.pod }} is restarting at {{ $value }} restarts/s.
+            Check pod logs: kubectl logs {{ $labels.pod }} -n northstar-prod --previous
+          runbook: runbooks/rollback.md
